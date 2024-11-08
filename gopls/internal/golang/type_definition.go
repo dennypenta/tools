@@ -51,3 +51,4 @@ func TypeDefinition(ctx context.Context, snapshot *cache.Snapshot, fh file.Handl
 	}
 	return []protocol.Location{loc}, nil
 }
+
