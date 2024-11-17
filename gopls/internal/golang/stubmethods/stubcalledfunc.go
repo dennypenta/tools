@@ -10,6 +10,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -91,7 +92,7 @@ func GetCallStubInfo(fset *token.FileSet, info *types.Info, path []ast.Node, pos
 // Emit writes to out the missing method based on type info of si.Receiver and CallExpr.
 func (si *CallStubInfo) Emit(out *bytes.Buffer, qual types.Qualifier) error {
 	params := si.collectParams()
-	rets := typesFromContext(si.info, si.path, si.path[0].Pos())
+	rets := TypesFromContext(si.info, si.path, si.path[0].Pos())
 	recv := si.Receiver.Obj()
 	// Pointer receiver?
 	var star string
@@ -204,7 +205,7 @@ func (si *CallStubInfo) collectParams() []param {
 // the hole that must be filled by EXPR has type (string, int).
 //
 // It returns nil on failure.
-func typesFromContext(info *types.Info, path []ast.Node, pos token.Pos) []types.Type {
+func TypesFromContext(info *types.Info, path []ast.Node, pos token.Pos) []types.Type {
 	var typs []types.Type
 	parent := parentNode(path)
 	if parent == nil {
@@ -278,6 +279,124 @@ func typesFromContext(info *types.Info, path []ast.Node, pos token.Pos) []types.
 				paramType = anyType
 			}
 			typs = append(typs, paramType)
+		}
+	case *ast.SelectorExpr:
+		for _, n := range path {
+			assignExpr, ok := n.(*ast.AssignStmt)
+			if ok {
+				for _, rh := range assignExpr.Rhs {
+					// basic types
+					basicLit, ok := rh.(*ast.BasicLit)
+					if ok {
+						switch basicLit.Kind {
+						case token.INT:
+							typs = append(typs, types.Typ[types.Int])
+						case token.FLOAT:
+							typs = append(typs, types.Typ[types.Float64])
+						case token.IMAG:
+							typs = append(typs, types.Typ[types.Complex128])
+						case token.STRING:
+							typs = append(typs, types.Typ[types.String])
+						case token.CHAR:
+							typs = append(typs, types.Typ[types.Rune])
+						}
+						break
+					}
+					callExpr, ok := rh.(*ast.CallExpr)
+					if ok {
+						if ident, ok := callExpr.Fun.(*ast.Ident); ok && ident.Name == "make" && len(callExpr.Args) > 0 {
+							arg := callExpr.Args[0]
+							composite, ok := arg.(*ast.CompositeLit)
+							if ok {
+								t := typeFromCompositeLit(info, path, composite)
+								typs = append(typs, t)
+								break
+							}
+							if t := info.TypeOf(arg); t != nil {
+								if !containsInvalid(t) {
+									t = types.Default(t)
+								} else {
+									t = anyType
+								}
+								typs = append(typs, t)
+							}
+						}
+						if ident, ok := callExpr.Fun.(*ast.Ident); ok && ident.Name == "new" && len(callExpr.Args) > 0 {
+							arg := callExpr.Args[0]
+							composite, ok := arg.(*ast.CompositeLit)
+							if ok {
+								t := typeFromCompositeLit(info, path, composite)
+								t = types.NewPointer(t)
+								typs = append(typs, t)
+								break
+							}
+							if t := info.TypeOf(arg); t != nil {
+								if !containsInvalid(t) {
+									t = types.Default(t)
+									t = types.NewPointer(t)
+								} else {
+									t = anyType
+								}
+								typs = append(typs, t)
+							}
+						}
+						break
+					}
+					// a variable
+					ident, ok := rh.(*ast.Ident)
+					if ok {
+						if t := typeFromIdent(info, path, ident); t != nil {
+							typs = append(typs, t)
+						}
+						break
+					}
+
+					selectorExpr, ok := rh.(*ast.SelectorExpr)
+					if ok {
+						if t := typeFromIdent(info, path, selectorExpr.Sel); t != nil {
+							typs = append(typs, t)
+						}
+						break
+					}
+					// composite
+					composite, ok := rh.(*ast.CompositeLit)
+					if ok {
+						t := typeFromCompositeLit(info, path, composite)
+						typs = append(typs, t)
+						break
+					}
+					// a pointer
+					un, ok := rh.(*ast.UnaryExpr)
+					if ok && un.Op == token.AND {
+						composite, ok := un.X.(*ast.CompositeLit)
+						if !ok {
+							break
+						}
+						if t := info.TypeOf(composite); t != nil {
+							if !containsInvalid(t) {
+								t = types.Default(t)
+								t = types.NewPointer(t)
+							} else {
+								t = anyType
+							}
+							typs = append(typs, t)
+						}
+					}
+					starExpr, ok := rh.(*ast.StarExpr)
+					if ok {
+						ident, ok := starExpr.X.(*ast.Ident)
+						if ok {
+							if t := typeFromIdent(info, path, ident); t != nil {
+								if pointer, ok := t.(*types.Pointer); ok {
+									t = pointer.Elem()
+								}
+								typs = append(typs, t)
+							}
+							break
+						}
+					}
+				}
+			}
 		}
 	default:
 		// TODO: support other common kinds of "holes", e.g.
@@ -366,4 +485,104 @@ func lastSection(identName string) string {
 	} else {
 		return identName
 	}
+}
+
+func typeFromCompositeLit(info *types.Info, path []ast.Node, composite *ast.CompositeLit) types.Type {
+	if t := info.TypeOf(composite); t != nil {
+		if !containsInvalid(t) {
+			t = types.Default(t)
+			if named, ok := t.(*types.Named); ok {
+				if pkg := named.Obj().Pkg(); pkg != nil {
+					// Find the file in the path that contains this assignment
+					var file *ast.File
+					for _, n := range path {
+						if f, ok := n.(*ast.File); ok {
+							file = f
+							break
+						}
+					}
+
+					if file != nil {
+						// Look for any import spec that imports this package
+						var pkgName string
+						for _, imp := range file.Imports {
+							if path, _ := strconv.Unquote(imp.Path.Value); path == pkg.Path() {
+								// Use the alias if specified, otherwise use package name
+								if imp.Name != nil {
+									pkgName = imp.Name.Name
+								} else {
+									pkgName = pkg.Name()
+								}
+								break
+							}
+						}
+						if pkgName == "" {
+							pkgName = pkg.Name() // fallback to package name if no import found
+						}
+
+						// Create new package with the correct name (either alias or original)
+						newPkg := types.NewPackage(pkgName, pkgName)
+						newName := types.NewTypeName(named.Obj().Pos(), newPkg, named.Obj().Name(), nil)
+						t = types.NewNamed(newName, named.Underlying(), nil)
+					}
+				}
+				return t
+			}
+		} else {
+			t = anyType
+		}
+		return t
+	}
+	return nil
+}
+
+func typeFromIdent(info *types.Info, path []ast.Node, ident *ast.Ident) types.Type {
+	if t := info.TypeOf(ident); t != nil {
+		if !containsInvalid(t) {
+			t = types.Default(t)
+			if named, ok := t.(*types.Named); ok {
+				if pkg := named.Obj().Pkg(); pkg != nil {
+					// find the file in the path that contains this assignment
+					var file *ast.File
+					for _, n := range path {
+						if f, ok := n.(*ast.File); ok {
+							file = f
+							break
+						}
+					}
+
+					if file != nil {
+						// look for any import spec that imports this package
+						var pkgName string
+						for _, imp := range file.Imports {
+							if path, _ := strconv.Unquote(imp.Path.Value); path == pkg.Path() {
+								// use the alias if specified, otherwise use package name
+								if imp.Name != nil {
+									pkgName = imp.Name.Name
+								} else {
+									pkgName = pkg.Name()
+								}
+								break
+							}
+						}
+						// fallback to package name if no import found
+						if pkgName == "" {
+							pkgName = pkg.Name()
+						}
+
+						// create new package with the correct name (either alias or original)
+						newPkg := types.NewPackage(pkgName, pkgName)
+						newName := types.NewTypeName(named.Obj().Pos(), newPkg, named.Obj().Name(), nil)
+						t = types.NewNamed(newName, named.Underlying(), nil)
+					}
+				}
+				return t
+			}
+		} else {
+			t = anyType
+		}
+		return t
+	}
+
+	return nil
 }
